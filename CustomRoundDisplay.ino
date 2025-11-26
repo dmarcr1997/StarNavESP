@@ -16,6 +16,7 @@
 #include "esp_camera.h"
 #define CAMERA_MODEL_XIAO_ESP32S3
 #include "camera_pins.h"
+#include "screen_press.h"
 
 enum DeviceState {
   LIVE_FEED,
@@ -419,10 +420,6 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
   return true;
 }
 
-bool screenPressed() {
-  return false;
-}
-
 void startLongExposureCapture() {
   if (!switchToGrayCam()) {
     Serial.println("Failed to switch to gray mode");
@@ -503,6 +500,7 @@ void handleInference() {
   state = SHOW_RESULTS;
 }
 void showResults() {
+  lcd_fill_color(0x1122);
 //beige screen
 //left hand corner draw [last_constellation]
 //middle center draw Confidence: num
@@ -542,6 +540,8 @@ void setup() {
       delay(1000);
     }
   }
+
+  touchInit();
 
   // Brief test flash
   lcd_fill_color(0x07E0); // green
