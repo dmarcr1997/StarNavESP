@@ -17,6 +17,24 @@
 #define CAMERA_MODEL_XIAO_ESP32S3
 #include "camera_pins.h"
 
+enum DeviceState {
+  LIVE_FEED,
+  CAPTURING,
+  INFERENCING,
+  SHOW_RESULTS
+};
+
+volatile DeviceState state = LIVE_FEED;
+volatile int frames_captured = 0;
+
+static const int STAR_W = 96;
+static const int STAR_H = 96;
+float accum_buffer[STAR_W * STAR_H];
+uint8_t ei_input[STAR_W * STAR_H]; 
+const int LONG_EXP_FRAMES = 48;
+String last_constellation = "";
+float last_confidence = 0.0f;
+
 bool init_camera_rgb565_240() {
   camera_config_t config;
   memset(&config, 0, sizeof(config));
@@ -109,11 +127,11 @@ bool init_camera_jpeg_240() {
   config.xclk_freq_hz = 20000000;
 
   config.pixel_format = PIXFORMAT_JPEG; 
-  config.frame_size   = FRAMESIZE_160X160;
+  config.frame_size   = FRAMESIZE_240X240;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
   config.grab_mode    = CAMERA_GRAB_LATEST;
   config.fb_count     = 2;
-  config.jpeg_quality = 20;
+  config.jpeg_quality = 10;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -128,6 +146,62 @@ bool init_camera_jpeg_240() {
   }
 
   return true;
+}
+bool init_camera_gray_96() {
+  camera_config_t config;
+  memset(&config, 0, sizeof(config));
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 20000000;
+
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.frame_size   = FRAMESIZE_96X96;       // matches STAR_W/H
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_count     = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Gray camera init failed: 0x%x\n", err);
+    return false;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 0);
+  }
+  return true;
+}
+
+bool switchToGrayCam() {
+  esp_camera_deinit();
+  delay(50);
+  return init_camera_gray_96();
+}
+
+bool switchToJpegCam() {
+  esp_camera_deinit();
+  delay(50);
+  return init_camera_jpeg_240();
 }
 
 inline void lcd_select()   { digitalWrite(TFT_CS, LOW); }
@@ -344,6 +418,104 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
   lcd_push_image(x, y, w, h, (const uint16_t*)bitmap);
   return true;
 }
+
+bool screenPressed() {
+  return false;
+}
+
+void startLongExposureCapture() {
+  if (!switchToGrayCam()) {
+    Serial.println("Failed to switch to gray mode");
+    return;
+  }
+  for(int i = 0; i< STAR_W * STAR_H; i++) {
+    accum_buffer[i] = 0.0f;
+  }
+  frames_captured = 0;
+
+  lcd_fill_color(0x0000);
+  Serial.println("Starting long exposure capture");
+}
+void finalizeLongExposure() {
+  float maxVal = 0.0f;
+  for (int i = 0; i < STAR_W * STAR_H; i++) {
+    if (accum_buffer[i] > maxVal) maxVal = accum_buffer[i];
+  }
+  if (maxVal < 1e-3f) maxVal = 1.0f;
+  for (int i = 0; i < STAR_W * STAR_H; i++) {
+    float norm = accum_buffer[i] / maxVal;
+    if (norm > 1.0f) norm = 1.0f;
+    ei_input[i] = (uint8_t)(norm * 255.0f);
+  }
+}
+
+void accumulateFromGray(camera_fb_t *fb) {
+  int w = fb->width;
+  int h = fb->height;
+  if (w != STAR_W || h != STAR_H) {
+    Serial.printf("Unexpected gray frame size: %dx%d\n", w, h);
+    return;
+  }
+  const uint8_t *src = fb->buf; // each byte is 0–255
+  for (int i = 0; i < STAR_W * STAR_H; i++) {
+    accum_buffer[i] += (float)src[i];
+  }
+}
+void handleCapture() {
+  if(frames_captured >= LONG_EXP_FRAMES) {
+    finalizeLongExposure();
+    state = INFERENCING;
+    return;
+    
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Capture failed during long exposure");
+    return;
+  }
+  accumulateFromGray(fb);
+
+  esp_camera_fb_return(fb);
+
+  frames_captured++;
+}
+void handleLiveFeed() {
+  if(screenPressed()) {
+    startLongExposureCapture();
+    state = CAPTURING;
+    return;
+  }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return;
+  }
+
+  TJpgDec.drawJpg(0, 0, fb->buf, fb->len);
+  
+  esp_camera_fb_return(fb);
+}
+void handleInference() {
+  //TODO: NEED TO TRAIN EDGE IMPULSE MODEL
+  last_constellation = "Orion";
+  last_confidence = 0.87f;
+  state = SHOW_RESULTS;
+}
+void showResults() {
+//beige screen
+//left hand corner draw [last_constellation]
+//middle center draw Confidence: num
+//TODO add directionality, north, ect based on this
+  if (screenPressed()) {
+      frames_captured = 0;
+      if (!switchToJpegCam()) {
+        Serial.println("Failed to switch back to JPEG mode");
+        return;
+      }
+      state = LIVE_FEED;
+  }
+}
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -378,43 +550,18 @@ void setup() {
 }
 
 void loop() {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    return;
+  switch(state) {
+    case LIVE_FEED:
+      handleLiveFeed();
+      break;
+    case CAPTURING:
+      handleCapture();
+      break;
+    case INFERENCING:
+      handleInference();
+      break;
+    case SHOW_RESULTS:
+      showResults();
+      break;
   }
-
-  // if (fb->format != PIXFORMAT_RGB565) {
-  //   Serial.println("Unexpected pixel format (not RGB565)");
-  //   esp_camera_fb_return(fb);
-  //   delay(100);
-  //   return;
-  // }
-
-  // uint16_t *pixels = (uint16_t *)fb->buf;
-  // int camW = fb->width;   // likely 320
-  // int camH = fb->height;  // likely 240
-
-  // // We want a 240x240 center crop from the camera frame
-  // const int dispW = TFT_WIDTH;
-  // const int dispH = TFT_HEIGHT;
-
-  // int xOffset = 0;
-  // int yOffset = 0;
-
-  // if (camW >= dispW) xOffset = (camW - dispW) / 2;
-  // if (camH >= dispH) yOffset = (camH - dispH) / 2;
-
-  // // Draw line by line to avoid extra buffers
-  // for (int y = 0; y < dispH; y++) {
-  //   int srcY = y + yOffset;
-  //   if (srcY < 0 || srcY >= camH) continue;
-
-  //   const uint16_t *lineStart = pixels + srcY * camW + xOffset;
-  //   lcd_push_image(0, y, dispW, 1, lineStart);
-  // }
-
-  TJpgDec.drawJpg(0, 0, fb->buf, fb->len);
-  
-  esp_camera_fb_return(fb);
 }

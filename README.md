@@ -1,2 +1,2 @@
 # StarNavESP
-Edge Start Navigator 
+Edge Star Navigator 
